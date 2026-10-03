@@ -7,6 +7,7 @@
 #include "GameFramework/Pawn.h"
 #include "NavigationSystem.h"
 #include "CollisionQueryParams.h"
+#include "EngineUtils.h"
 
 UTacticalSubsystem::UTacticalSubsystem()
 {}
@@ -105,6 +106,15 @@ void UTacticalSubsystem::GenerateCoverPoints()
 	FCollisionQueryParams QueryParams;
 	QueryParams.bTraceComplex = false;
 
+	// Use TActorIterator to ignore all live Pawns so characters never register as walls
+	for (TActorIterator<APawn> It(World); It; ++It)
+	{
+		if (APawn* P = *It)
+		{
+			QueryParams.AddIgnoredActor(P);
+		}
+	}
+
 	const FCollisionShape CharacterCapsule = FCollisionShape::MakeCapsule(40.0f, 88.0f);
 
 	for (int32 Y = 0; Y < GridHeight; ++Y)
@@ -113,7 +123,6 @@ void UTacticalSubsystem::GenerateCoverPoints()
 		{
 			const FVector ProbeLocation = GridToWorld(X, Y);
 
-			// Tight extent (30cm x 30cm x 50cm) prevents snapping across vertical gaps/platforms
 			FNavLocation NavLocation;
 			const bool bOnNavMesh = NavSys->ProjectPointToNavigation(
 				ProbeLocation,
@@ -130,7 +139,6 @@ void UTacticalSubsystem::GenerateCoverPoints()
 
 			for (const FVector& Direction : TraceDirections)
 			{
-				// 1. LOW TRACE at 50cm
 				const FVector LowStart = BasePos + FVector(0.0f, 0.0f, 50.0f);
 				const FVector LowEnd = LowStart + (Direction * TraceDistance);
 
@@ -143,33 +151,29 @@ void UTacticalSubsystem::GenerateCoverPoints()
 					QueryParams
 				);
 
-				if (!bHitLow || !LowHit.bBlockingHit)
+				if (!bHitLow || !LowHit.bBlockingHit || !LowHit.GetActor() || LowHit.GetActor()->IsA<APawn>())
 				{
 					continue;
 				}
 
-				// FILTER A: STRICT VERTICAL WALL NORMAL
-				// Eliminates ramps, slopes, and wedge edges (Z must be ~0)
+				// Vertical wall filter (excludes ramps)
 				if (FMath::Abs(LowHit.ImpactNormal.Z) > 0.08f)
 				{
 					continue;
 				}
 
-				// FILTER B: MINIMUM BARRIER HEIGHT (Stair/Curb killer)
-				// Low cover must be at least 65cm tall; stairs are ~15-20cm per step
+				// Minimum barrier height check (65cm)
 				const FVector MidStart = BasePos + FVector(0.0f, 0.0f, 65.0f);
 				const FVector MidEnd = MidStart + (Direction * TraceDistance);
 				FHitResult MidHit;
 				const bool bHitMid = World->LineTraceSingleByChannel(MidHit, MidStart, MidEnd, ECC_WorldStatic, QueryParams);
-				if (!bHitMid || !MidHit.bBlockingHit)
+				if (!bHitMid || !MidHit.bBlockingHit || (MidHit.GetActor() && MidHit.GetActor()->IsA<APawn>()))
 				{
 					continue;
 				}
 
-				// Compute candidate position offset along the wall normal
 				const FVector CandidatePos = LowHit.ImpactPoint + (LowHit.ImpactNormal * WallOffsetDistance);
 
-				// Snap candidate to local NavMesh
 				FNavLocation CoverNavLoc;
 				const bool bCoverReachable = NavSys->ProjectPointToNavigation(
 					CandidatePos,
@@ -182,8 +186,7 @@ void UTacticalSubsystem::GenerateCoverPoints()
 					continue;
 				}
 
-				// FILTER C: PHYSICAL CAPSULE CLEARANCE (The Crevice & Corner Killer)
-				// Verifies a 40cm radius x 88cm half-height capsule physically fits without overlapping geometry
+				// Capsule clearance test
 				const FVector CapsuleCenter = CoverNavLoc.Location + FVector(0.0f, 0.0f, 90.0f);
 				const bool bCapsuleBlocked = World->OverlapBlockingTestByChannel(
 					CapsuleCenter,
@@ -198,7 +201,7 @@ void UTacticalSubsystem::GenerateCoverPoints()
 					continue;
 				}
 
-				// FILTER D: MINIMUM SPACING FROM OTHER COVER POINTS
+				// Spacing check
 				bool bTooClose = false;
 				for (const FCoverPoint& ExistingPoint : CoverPoints)
 				{
@@ -214,7 +217,7 @@ void UTacticalSubsystem::GenerateCoverPoints()
 					continue;
 				}
 
-				// High trace at 130cm to determine Low vs High cover
+				// High trace (130cm) for cover height classification
 				const FVector HighStart = CoverNavLoc.Location + FVector(0.0f, 0.0f, 130.0f);
 				const FVector HighEnd = HighStart - (LowHit.ImpactNormal * (WallOffsetDistance + 40.0f));
 
@@ -227,10 +230,12 @@ void UTacticalSubsystem::GenerateCoverPoints()
 					QueryParams
 				);
 
+				const bool bIsHighCover = (bHitHigh && HighHit.bBlockingHit && (!HighHit.GetActor() || !HighHit.GetActor()->IsA<APawn>()));
+
 				FCoverPoint NewCover;
 				NewCover.Location = CoverNavLoc.Location;
 				NewCover.WallNormal = LowHit.ImpactNormal;
-				NewCover.CoverType = (bHitHigh && HighHit.bBlockingHit) ? ECoverType::HighCover : ECoverType::LowCover;
+				NewCover.CoverType = bIsHighCover ? ECoverType::HighCover : ECoverType::LowCover;
 				NewCover.bIsOccupied = false;
 
 				CoverPoints.Add(NewCover);
@@ -263,7 +268,6 @@ bool UTacticalSubsystem::FindBestCover(
 		return false;
 	}
 
-	// Ensure the querier position is projected to valid NavMesh space
 	FNavLocation ProjectedQuerier;
 	if (!NavSys->ProjectPointToNavigation(QuerierLocation, ProjectedQuerier, FVector(100.0f, 100.0f, 200.0f)))
 	{
@@ -274,6 +278,11 @@ bool UTacticalSubsystem::FindBestCover(
 	int32 BestIndex = INDEX_NONE;
 
 	const float MaxSearchDist = 2500.0f;
+	const float CurrentDistToThreat = FVector::Dist2D(ProjectedQuerier.Location, ThreatLocation);
+
+	// Safe combat standoff distance (7.5 meters)
+	const float ThreatDangerRadius = 750.0f;
+
 	FCollisionQueryParams LoSParams;
 	LoSParams.bTraceComplex = false;
 
@@ -286,14 +295,14 @@ bool UTacticalSubsystem::FindBestCover(
 			continue;
 		}
 
-		// Distance filter relative to querier
+		// 1. Distance filter
 		const float DistToCover = FVector::Dist2D(ProjectedQuerier.Location, Cover.Location);
 		if (DistToCover > MaxSearchDist)
 		{
 			continue;
 		}
 
-		// Directional test: wall normal must face away from the threat
+		// 2. Directional check: wall normal must face away from threat
 		const FVector DirFromCoverToThreat = (ThreatLocation - Cover.Location).GetSafeNormal2D();
 		const float WallDot = FVector::DotProduct(Cover.WallNormal, DirFromCoverToThreat);
 		if (WallDot > -0.05f)
@@ -301,7 +310,7 @@ bool UTacticalSubsystem::FindBestCover(
 			continue;
 		}
 
-		// Physical Occlusion test (Line Trace)
+		// 3. Occlusion raycast test
 		const float EyeHeight = (Cover.CoverType == ECoverType::LowCover) ? 50.0f : 120.0f;
 		const FVector CoverEyePos = Cover.Location + FVector(0.0f, 0.0f, EyeHeight);
 		const FVector ThreatEyePos = ThreatLocation + FVector(0.0f, 0.0f, 60.0f);
@@ -320,14 +329,53 @@ bool UTacticalSubsystem::FindBestCover(
 			continue;
 		}
 
-		// Synchronous NavMesh Reachability
+		// 4. PATH TRAVERSAL & CONTINUOUS SEGMENT INTERSECTION TEST
 		FPathFindingQuery Query(nullptr, *NavData, ProjectedQuerier.Location, Cover.Location);
-		if (!NavSys->TestPathSync(Query))
+		FPathFindingResult PathResult = NavSys->FindPathSync(Query);
+
+		if (!PathResult.IsSuccessful() || !PathResult.Path.IsValid())
 		{
 			continue;
 		}
 
-		// Scoring
+		const TArray<FNavPathPoint>& PathPoints = PathResult.Path->GetPathPoints();
+		bool bRouteEntersDangerZone = false;
+
+		// Evaluate every continuous line segment along the route
+		for (int32 PointIdx = 0; PointIdx < PathPoints.Num() - 1; ++PointIdx)
+		{
+			const FVector SegStart = PathPoints[PointIdx].Location;
+			const FVector SegEnd = PathPoints[PointIdx + 1].Location;
+
+			// Computes the shortest 3D distance from the Threat to this path segment
+			const float DistToSegment = FMath::PointDistToSegment(ThreatLocation, SegStart, SegEnd);
+
+			// RULE A: Outside danger bubble -> entirely forbidden from entering it
+			if (CurrentDistToThreat >= ThreatDangerRadius)
+			{
+				if (DistToSegment < ThreatDangerRadius)
+				{
+					bRouteEntersDangerZone = true;
+					break;
+				}
+			}
+			// RULE B: Already inside danger bubble -> forbidden from moving closer than starting position
+			else
+			{
+				if (DistToSegment < (CurrentDistToThreat - 50.0f))
+				{
+					bRouteEntersDangerZone = true;
+					break;
+				}
+			}
+		}
+
+		if (bRouteEntersDangerZone)
+		{
+			continue;
+		}
+
+		// 5. Composite Scoring
 		const float OcclusionQuality = -WallDot;
 		const float NormalizedDist = DistToCover / MaxSearchDist;
 		const float CellFlank = GetFlankScoreAtLocation(Cover.Location);
@@ -342,7 +390,6 @@ bool UTacticalSubsystem::FindBestCover(
 			Score = (OcclusionQuality * 4.0f) - (NormalizedDist * 2.5f);
 		}
 
-		// Hysteresis bonus for stability
 		if (i == LastSelectedCoverIndex)
 		{
 			Score += 1.5f;
@@ -364,6 +411,7 @@ bool UTacticalSubsystem::FindBestCover(
 
 	return false;
 }
+
 bool UTacticalSubsystem::ReserveCover(const FVector& CoverLocation, AActor* ClaimingActor)
 {
 	if (!ClaimingActor)
@@ -456,8 +504,6 @@ void UTacticalSubsystem::UpdateGrid()
 		}
 	}
 
-	// Query best defensive cover relative to the player's current location
-	// Uses PlayerLocation as both querier reference and threat so the debug query is always on valid NavMesh
 	bHasValidDebugCover = FindBestCover(
 		PlayerLocation,
 		PlayerLocation,
@@ -471,6 +517,7 @@ void UTacticalSubsystem::UpdateGrid()
 		DrawDebugCover();
 	}
 }
+
 void UTacticalSubsystem::DrawDebugGrid()
 {
 	UWorld* World = GetWorld();
