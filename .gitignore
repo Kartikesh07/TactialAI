@@ -1,0 +1,27 @@
+# Visual Studio / IDE temporary files
+.vs/
+*.sln
+*.suo
+*.user
+*.code-workspace
+.idea/
+.vscode/
+
+# Unreal Engine build & cache directories (regenerated automatically)
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Auto-generated Xcode / CLion files
+*.xcodeproj
+*.xcworkspace
+
+# Crash reports and package outputs
+/CrashReportClient/
+*.log
+*.dmp
+
+# Ignore local asset backup autosaves
+Content/Autosaves/
